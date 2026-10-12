@@ -1,0 +1,88 @@
+import com.hazelcast.config.Config;
+import com.hazelcast.core.Hazelcast;
+import com.hazelcast.core.HazelcastInstance;
+import io.opentelemetry.api.OpenTelemetry;
+import org.junit.jupiter.api.*;
+import java.time.Duration;
+import java.util.Optional;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class SessionIntegrationTest {
+
+    private static HazelcastInstance hzInstance;
+    private UserSessionManager manager;
+
+    @BeforeAll
+    public static void startHazelcast() {
+        Config config = new Config();
+        config.setClusterName("test-cluster");
+        hzInstance = Hazelcast.newHazelcastInstance(config);
+    }
+
+    @AfterAll
+    public static void shutdownHazelcast() {
+        if (hzInstance != null) hzInstance.shutdown();
+    }
+
+    @BeforeEach
+    public void setupManager() {
+        hzInstance.getMap("testMap").clear();
+        hzInstance.getMultiMap("testIdx").clear();
+
+        // Política que no expira durante los tests
+        ExpirationManager expiration = new DefaultExpirationManager(new SessionExpirationPolicy() {
+            public Duration getIdleTimeout() { return Duration.ofHours(1); }
+            public Optional<Duration> getAbsoluteTimeout() { return Optional.empty(); }
+        });
+
+        // Ensamblaje Hexagonal completo con wrappers
+        SessionBackendSPI rawBackend = new LegacyHazelcastBackend(hzInstance, "testMap", "testIdx");
+        SessionBackendSPI observableBackend = new ObservableSessionBackendSPI(rawBackend, OpenTelemetry.noop());
+        
+        GenericSessionManager coreManager = new GenericSessionManager(
+                observableBackend, expiration, UserSessionConcurrencyPolicy.MULTIPLE
+        );
+        
+        manager = new ObservableSessionManager(coreManager, OpenTelemetry.noop());
+    }
+
+    @Test
+    public void testSessionCreationAndRouting() {
+        Session session = manager.createSession();
+        
+        Optional<Session> retrieved = manager.getSession(session.getPublicId());
+        assertTrue(retrieved.isPresent());
+        assertEquals(session.getInternalId(), retrieved.get().getInternalId());
+        assertEquals(SessionStatus.INIT, retrieved.get().getStatus());
+    }
+
+    @Test
+    public void testSessionFixation_RotateID() {
+        Session initial = manager.createSession();
+        SessionIdentifier oldId = initial.getPublicId();
+
+        // Guardamos un atributo tipado
+        TypedAttributeKey<String> langKey = TypedAttributeKey.of("lang", String.class);
+        initial.getAttributes().put(langKey, "es-AR");
+
+        Session rotated = manager.rotatePublicId(oldId);
+
+        // Verificaciones críticas de seguridad
+        assertNotEquals(oldId, rotated.getPublicId(), "El ID público DEBE cambiar");
+        assertEquals(initial.getInternalId(), rotated.getInternalId(), "El ID interno DEBE conservarse");
+        assertFalse(manager.getSession(oldId).isPresent(), "El ID público viejo debe ser revocado");
+        
+        // Verificación de Atributos
+        assertEquals("es-AR", rotated.getAttributes().get(langKey).get());
+    }
+
+    @Test
+    public void testAuthentication_FSM_Transition() {
+        Session anon = manager.createSession();
+        UserSession auth = manager.authenticateSession(anon.getPublicId(), "gpittau");
+
+        assertEquals(SessionStatus.AUTHENTICATED, auth.getStatus());
+        assertEquals("gpittau", auth.getUserId());
+        assertEquals(1, manager.getSessionsForUser("gpittau").size());
+    }
+}

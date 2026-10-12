@@ -3,3 +3,7 @@ modules = ["java-graalvm22.3"]
 
 [nix]
 packages = ["bat", "lf", "neovim"]
+
+[[ports]]
+localPort = 5701
+externalPort = 80

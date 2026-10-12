@@ -1,0 +1,83 @@
+import com.hazelcast.core.HazelcastInstance;
+import io.opentelemetry.api.OpenTelemetry;
+import org.junit.jupiter.api.*;
+import java.time.Duration;
+import java.util.List;
+import java.util.Optional;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class ConcurrencyPolicyIntegrationTest {
+
+    private static HazelcastInstance hzInstance = /* ... (Igual que en SessionIntegrationTest) ... */;
+    
+    // Método de ayuda para instanciar el manager con diferentes políticas por test
+    private UserSessionManager createManagerWithPolicy(UserSessionConcurrencyPolicy policy) {
+        hzInstance.getMap("cMap").clear();
+        hzInstance.getMultiMap("cIdx").clear();
+        
+        ExpirationManager noExp = new DefaultExpirationManager(new SessionExpirationPolicy() {
+            public Duration getIdleTimeout() { return Duration.ofHours(1); }
+            public Optional<Duration> getAbsoluteTimeout() { return Optional.empty(); }
+        });
+
+        SessionBackendSPI backend = new LegacyHazelcastBackend(hzInstance, "cMap", "cIdx");
+        return new GenericSessionManager(backend, noExp, policy);
+    }
+
+    @Test
+    public void testPolicy_SingleReject() {
+        UserSessionManager manager = createManagerWithPolicy(UserSessionConcurrencyPolicy.SINGLE_REJECT);
+        String userId = "dev-arquitecto";
+
+        // Login 1 -> OK
+        Session s1 = manager.createSession();
+        manager.authenticateSession(s1.getPublicId(), userId);
+
+        // Login 2 -> Debe lanzar excepción
+        Session s2 = manager.createSession();
+        assertThrows(ConcurrentSessionRejectedException.class, () -> {
+            manager.authenticateSession(s2.getPublicId(), userId);
+        });
+
+        // Verificamos que solo quedó viva la primera
+        List<UserSession> actives = manager.getSessionsForUser(userId);
+        assertEquals(1, actives.size());
+    }
+
+    @Test
+    public void testPolicy_SingleReplace() {
+        UserSessionManager manager = createManagerWithPolicy(UserSessionConcurrencyPolicy.SINGLE_REPLACE);
+        String userId = "dev-arquitecto";
+
+        // Login 1 (Ej. Computadora)
+        Session s1 = manager.createSession();
+        UserSession auth1 = manager.authenticateSession(s1.getPublicId(), userId);
+
+        // Login 2 (Ej. Celular)
+        Session s2 = manager.createSession();
+        UserSession auth2 = manager.authenticateSession(s2.getPublicId(), userId);
+
+        // Recuperar sesiones
+        List<UserSession> actives = manager.getSessionsForUser(userId);
+        
+        // Verificaciones
+        assertEquals(1, actives.size(), "Debe existir solo 1 sesión activa");
+        assertEquals(auth2.getInternalId(), actives.get(0).getInternalId(), "La sesión ganadora debe ser la ÚLTIMA");
+        
+        // El ID público de la primera sesión debió ser destruido
+        assertFalse(manager.getSession(auth1.getPublicId()).isPresent());
+    }
+
+    @Test
+    public void testPolicy_Multiple() {
+        UserSessionManager manager = createManagerWithPolicy(UserSessionConcurrencyPolicy.MULTIPLE);
+        String userId = "dev-arquitecto";
+
+        manager.authenticateSession(manager.createSession().getPublicId(), userId);
+        manager.authenticateSession(manager.createSession().getPublicId(), userId);
+        manager.authenticateSession(manager.createSession().getPublicId(), userId);
+
+        List<UserSession> actives = manager.getSessionsForUser(userId);
+        assertEquals(3, actives.size(), "Debe permitir múltiples sesiones simultáneas");
+    }
+}

@@ -1,0 +1,67 @@
+import org.junit.jupiter.api.Test;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Optional;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class DomainUnitTests {
+
+    @Test
+    public void testValueObjectEquality() {
+        SessionIdentifier id1 = SessionIdentifier.of("token-123");
+        SessionIdentifier id2 = SessionIdentifier.of("token-123");
+        assertDoesNotThrow(() -> SessionIdentifier.of("token-456"));
+        
+        assertEquals(id1, id2, "El mismo valor debe generar igualdad de Value Objects");
+        assertEquals(id1.hashCode(), id2.hashCode());
+        assertThrows(NullPointerException.class, () -> SessionIdentifier.of(null));
+    }
+
+    @Test
+    public void testExpirationManager() {
+        SessionExpirationPolicy policy = new SessionExpirationPolicy() {
+            public Duration getIdleTimeout() { return Duration.ofMinutes(15); }
+            public Optional<Duration> getAbsoluteTimeout() { return Optional.of(Duration.ofHours(4)); }
+        };
+        ExpirationManager manager = new DefaultExpirationManager(policy);
+
+        Instant creation = Instant.now().minus(Duration.ofHours(2));
+        Instant recentAccess = Instant.now().minus(Duration.ofMinutes(5));
+        Instant oldAccess = Instant.now().minus(Duration.ofMinutes(20));
+        Instant veryOldCreation = Instant.now().minus(Duration.ofHours(5));
+
+        assertFalse(manager.isExpired(creation, recentAccess), "Activo recientemente -> No expira");
+        assertTrue(manager.isExpired(creation, oldAccess), "Inactivo 20m (límite 15m) -> Expira");
+        assertTrue(manager.isExpired(veryOldCreation, Instant.now()), "Vivo por 5h (límite 4h absoluta) -> Expira");
+    }
+
+    @Test
+    public void testSessionLifecycleFSM_ValidTransitions() {
+        StateMachine<SessionStatus, SessionEvent, SessionContext> fsm = SessionLifecycleFsm.build();
+        SessionContext ctx = new SessionContext("user-1");
+
+        // Transición de INIT a AUTHENTICATED
+        SessionStatus state1 = fsm.fire(SessionStatus.INIT, SessionEvent.AUTHENTICATE, ctx);
+        assertEquals(SessionStatus.AUTHENTICATED, state1);
+
+        // Transición de AUTHENTICATED a EXPIRED
+        SessionStatus state2 = fsm.fire(state1, SessionEvent.EXPIRE, ctx);
+        assertEquals(SessionStatus.EXPIRED, state2);
+    }
+
+    @Test
+    public void testSessionLifecycleFSM_InvalidTransitions() {
+        StateMachine<SessionStatus, SessionEvent, SessionContext> fsm = SessionLifecycleFsm.build();
+        SessionContext ctx = new SessionContext("user-1");
+
+        // Intentar Autenticar una sesión ya autenticada debe fallar
+        assertThrows(IllegalStateException.class, () -> {
+            fsm.fire(SessionStatus.AUTHENTICATED, SessionEvent.AUTHENTICATE, ctx);
+        });
+
+        // Intentar revocar una sesión ya expirada (Estado Terminal)
+        assertThrows(IllegalStateException.class, () -> {
+            fsm.fire(SessionStatus.EXPIRED, SessionEvent.REVOKE, ctx);
+        });
+    }
+}
