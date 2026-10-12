@@ -1,2 +1,5 @@
-run = "mvn -q compile exec:java"
+run = "mvn clean test"
 modules = ["java-graalvm22.3"]
+
+[nix]
+packages = ["bat", "lf", "neovim"]

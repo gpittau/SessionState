@@ -1,0 +1,585 @@
+import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.map.IMap;
+import com.hazelcast.multimap.MultiMap;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.metrics.DoubleHistogram;
+import io.opentelemetry.api.metrics.LongCounter;
+import io.opentelemetry.api.metrics.Meter;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.trace.Tracer;
+
+import java.io.Serializable;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+// ==========================================
+// 1. DOMAIN: Identificadores y Tipos
+// ==========================================
+
+public final class SessionIdentifier {
+    private final String value;
+    private SessionIdentifier(String value) { this.value = Objects.requireNonNull(value); }
+    public static SessionIdentifier of(String value) { return new SessionIdentifier(value); }
+    public String getValue() { return value; }
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof SessionIdentifier)) return false;
+        return value.equals(((SessionIdentifier) o).value);
+    }
+    @Override public int hashCode() { return Objects.hash(value); }
+}
+
+public final class InternalSessionIdentifier {
+    private final String value;
+    private InternalSessionIdentifier(String value) { this.value = Objects.requireNonNull(value); }
+    public static InternalSessionIdentifier of(String value) { return new InternalSessionIdentifier(value); }
+    public String getValue() { return value; }
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof InternalSessionIdentifier)) return false;
+        return value.equals(((InternalSessionIdentifier) o).value);
+    }
+    @Override public int hashCode() { return Objects.hash(value); }
+}
+
+public final class TypedAttributeKey<T> {
+    private final String name;
+    private final Class<T> type;
+    private TypedAttributeKey(String name, Class<T> type) {
+        this.name = Objects.requireNonNull(name);
+        this.type = Objects.requireNonNull(type);
+    }
+    public static <T> TypedAttributeKey<T> of(String name, Class<T> type) { return new TypedAttributeKey<>(name, type); }
+    public String getName() { return name; }
+    public Class<T> getType() { return type; }
+    @Override public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof TypedAttributeKey)) return false;
+        return name.equals(((TypedAttributeKey<?>) o).name);
+    }
+    @Override public int hashCode() { return Objects.hash(name); }
+}
+
+// ==========================================
+// 2. DOMAIN: Máquina de Estados (FSM Genérica)
+// ==========================================
+
+public interface WorkflowContext { }
+
+@FunctionalInterface
+public interface Action<S, E, C extends WorkflowContext> {
+    void execute(S source, S target, E event, C context);
+}
+
+@FunctionalInterface
+public interface Guard<C extends WorkflowContext> {
+    boolean evaluate(C context);
+}
+
+public class StateMachine<S, E, C extends WorkflowContext> {
+    private final Map<S, Map<E, List<Transition<S, E, C>>>> transitionTable;
+
+    private StateMachine(Map<S, Map<E, List<Transition<S, E, C>>>> transitionTable) {
+        this.transitionTable = transitionTable;
+    }
+
+    public S fire(S currentState, E event, C context) {
+        Map<E, List<Transition<S, E, C>>> availableEvents = transitionTable.getOrDefault(currentState, Collections.emptyMap());
+        List<Transition<S, E, C>> possibleTransitions = availableEvents.getOrDefault(event, Collections.emptyList());
+
+        for (Transition<S, E, C> transition : possibleTransitions) {
+            if (transition.guard.map(g -> g.evaluate(context)).orElse(true)) {
+                transition.action.ifPresent(a -> a.execute(currentState, transition.target, event, context));
+                return transition.target;
+            }
+        }
+        throw new IllegalStateException("Transición inválida o Guards fallidos para [" + currentState + "] + [" + event + "]");
+    }
+
+    public static <S, E, C extends WorkflowContext> Builder<S, E, C> builder() { return new Builder<>(); }
+
+    public static class Builder<S, E, C extends WorkflowContext> {
+        private final Map<S, Map<E, List<Transition<S, E, C>>>> table = new HashMap<>();
+        public TransitionBuilder<S, E, C> from(S source) { return new TransitionBuilder<>(this, source); }
+        private void addTransition(Transition<S, E, C> transition) {
+            table.computeIfAbsent(transition.source, k -> new HashMap<>())
+                 .computeIfAbsent(transition.event, k -> new ArrayList<>())
+                 .add(transition);
+        }
+        public StateMachine<S, E, C> build() { return new StateMachine<>(table); }
+    }
+
+    public static class TransitionBuilder<S, E, C extends WorkflowContext> {
+        private final Builder<S, E, C> parent;
+        private final S source;
+        private E event;
+        private S target;
+        private Guard<C> guard;
+        private Action<S, E, C> action;
+
+        private TransitionBuilder(Builder<S, E, C> parent, S source) {
+            this.parent = parent; this.source = source;
+        }
+        public TransitionBuilder<S, E, C> on(E event) { this.event = event; return this; }
+        public TransitionBuilder<S, E, C> to(S target) { this.target = target; return this; }
+        public TransitionBuilder<S, E, C> guard(Guard<C> guard) { this.guard = guard; return this; }
+        public TransitionBuilder<S, E, C> action(Action<S, E, C> action) { this.action = action; return this; }
+        public Builder<S, E, C> and() {
+            Objects.requireNonNull(event); Objects.requireNonNull(target);
+            parent.addTransition(new Transition<>(source, target, event, guard, action));
+            return parent;
+        }
+    }
+
+    private static class Transition<S, E, C extends WorkflowContext> {
+        final S source; final S target; final E event;
+        final Optional<Guard<C>> guard; final Optional<Action<S, E, C>> action;
+        Transition(S source, S target, E event, Guard<C> guard, Action<S, E, C> action) {
+            this.source = source; this.target = target; this.event = event;
+            this.guard = Optional.ofNullable(guard); this.action = Optional.ofNullable(action);
+        }
+    }
+}
+
+// ==========================================
+// 3. DOMAIN: Sesión de Usuario, Eventos y FSM Config
+// ==========================================
+
+public enum SessionStatus { INIT, AUTHENTICATED, EXPIRED, INVALIDATED }
+public enum SessionEvent { AUTHENTICATE, EXPIRE, REVOKE }
+public enum UserSessionConcurrencyPolicy { MULTIPLE, SINGLE_REJECT, SINGLE_REPLACE }
+
+public class ConcurrentSessionRejectedException extends RuntimeException {
+    public ConcurrentSessionRejectedException(String message) { super(message); }
+}
+
+public class SessionContext implements WorkflowContext {
+    public final String userId; // Nullable
+    public SessionContext(String userId) { this.userId = userId; }
+}
+
+/** Configuración Singleton de la Máquina de Estados del Ciclo de Vida */
+public class SessionLifecycleFsm {
+    public static StateMachine<SessionStatus, SessionEvent, SessionContext> build() {
+        return StateMachine.<SessionStatus, SessionEvent, SessionContext>builder()
+            .from(SessionStatus.INIT).on(SessionEvent.AUTHENTICATE).to(SessionStatus.AUTHENTICATED).and()
+            .from(SessionStatus.INIT).on(SessionEvent.EXPIRE).to(SessionStatus.EXPIRED).and()
+            .from(SessionStatus.INIT).on(SessionEvent.REVOKE).to(SessionStatus.INVALIDATED).and()
+            .from(SessionStatus.AUTHENTICATED).on(SessionEvent.EXPIRE).to(SessionStatus.EXPIRED).and()
+            .from(SessionStatus.AUTHENTICATED).on(SessionEvent.REVOKE).to(SessionStatus.INVALIDATED).and()
+            .build();
+    }
+}
+
+public interface SessionExpirationPolicy {
+    Duration getIdleTimeout();
+    Optional<Duration> getAbsoluteTimeout();
+}
+
+public class ExpirationManager {
+    private final SessionExpirationPolicy policy;
+    public ExpirationManager(SessionExpirationPolicy policy) { this.policy = Objects.requireNonNull(policy); }
+    public boolean isExpired(Instant creationTime, Instant lastAccessTime) {
+        Instant now = Instant.now();
+        if (Duration.between(lastAccessTime, now).compareTo(policy.getIdleTimeout()) > 0) return true;
+        return policy.getAbsoluteTimeout()
+            .map(maxLife -> Duration.between(creationTime, now).compareTo(maxLife) > 0).orElse(false);
+    }
+}
+
+// ==========================================
+// 4. API Pública: Atributos y Sesión
+// ==========================================
+
+public interface AttributeStorage {
+    <T> Optional<T> get(TypedAttributeKey<T> key);
+    <T> void put(TypedAttributeKey<T> key, T value);
+    <T> void remove(TypedAttributeKey<T> key);
+    void clear();
+}
+
+public interface Session {
+    SessionIdentifier getPublicId();
+    InternalSessionIdentifier getInternalId();
+    SessionStatus getStatus();
+    Instant getCreationTime();
+    Instant getLastAccessTime();
+    AttributeStorage getAttributes();
+    void invalidate();
+}
+
+public interface UserSession extends Session {
+    String getUserId();
+}
+
+public interface UserSessionManager {
+    Session createSession();
+    Optional<Session> getSession(SessionIdentifier publicId);
+    Session rotatePublicId(SessionIdentifier currentPublicId);
+    UserSession authenticateSession(SessionIdentifier publicId, String userId);
+    List<UserSession> getSessionsForUser(String userId);
+    void invalidateAllUserSessions(String userId);
+    void touch(SessionIdentifier publicId);
+    void invalidateSession(SessionIdentifier publicId);
+}
+
+// ==========================================
+// 5. INFRASTRUCTURE: SPI (Service Provider Interface)
+// ==========================================
+
+public class SessionStateDto implements Serializable {
+    private static final long serialVersionUID = 1L;
+    public final String internalId;
+    public String currentPublicId;
+    public String userId;
+    public SessionStatus status;
+    public final Instant creationTime;
+    public Instant lastAccessTime;
+
+    public SessionStateDto(String internalId, String currentPublicId, String userId, SessionStatus status) {
+        this.internalId = internalId; this.currentPublicId = currentPublicId;
+        this.userId = userId; this.status = status;
+        this.creationTime = Instant.now(); this.lastAccessTime = this.creationTime;
+    }
+}
+
+public interface SessionBackendSPI {
+    Optional<String> getInternalId(String publicId);
+    boolean mapRouteIfAbsent(String publicId, String internalId);
+    void deleteRoute(String publicId);
+    
+    void saveState(SessionStateDto state);
+    Optional<SessionStateDto> getState(String internalId);
+    void deleteState(String internalId);
+    
+    void indexUserSession(String userId, String internalId);
+    void removeUserSession(String userId, String internalId);
+    List<String> getInternalIdsForUser(String userId);
+    
+    DistributedLock acquireLock(String lockKey, Duration maxLeaseTime);
+    interface DistributedLock extends AutoCloseable { @Override void close(); }
+
+    <T> Optional<T> getAttribute(String internalId, String key, Class<T> type);
+    void putAttribute(String internalId, String key, Object value);
+    void removeAttribute(String internalId, String key);
+    void clearAllAttributes(String internalId);
+}
+
+// ==========================================
+// 6. CORE: GenericSessionManager (Agnóstico a Backend)
+// ==========================================
+
+public class GenericSessionManager implements UserSessionManager {
+
+    private final SessionBackendSPI backend;
+    private final ExpirationManager expirationManager;
+    private final UserSessionConcurrencyPolicy concurrencyPolicy;
+    private final StateMachine<SessionStatus, SessionEvent, SessionContext> fsm;
+
+    public GenericSessionManager(SessionBackendSPI backend, ExpirationManager expirationManager, UserSessionConcurrencyPolicy concurrencyPolicy) {
+        this.backend = backend;
+        this.expirationManager = expirationManager;
+        this.concurrencyPolicy = concurrencyPolicy;
+        this.fsm = SessionLifecycleFsm.build();
+    }
+
+    @Override
+    public Session createSession() {
+        String internalId = UUID.randomUUID().toString();
+        String publicId = UUID.randomUUID().toString();
+        SessionStateDto state = new SessionStateDto(internalId, publicId, null, SessionStatus.INIT);
+        
+        backend.saveState(state);
+        backend.mapRouteIfAbsent(publicId, internalId);
+        return buildSession(state);
+    }
+
+    @Override
+    public Optional<Session> getSession(SessionIdentifier publicId) {
+        return backend.getInternalId(publicId.getValue())
+            .flatMap(backend::getState)
+            .filter(this::checkExpirationAndClean)
+            .map(this::buildSession);
+    }
+
+    @Override
+    public Session rotatePublicId(SessionIdentifier currentPublicId) {
+        String publicIdVal = currentPublicId.getValue();
+        String internalId = backend.getInternalId(publicIdVal).orElseThrow(() -> new IllegalArgumentException("Sesión inválida"));
+        String newPublicId = UUID.randomUUID().toString();
+        
+        if (backend.mapRouteIfAbsent(newPublicId, internalId)) {
+            backend.deleteRoute(publicIdVal);
+            SessionStateDto state = backend.getState(internalId).orElseThrow(IllegalStateException::new);
+            state.currentPublicId = newPublicId;
+            backend.saveState(state);
+            return buildSession(state);
+        }
+        throw new IllegalStateException("Colisión CAS durante rotación");
+    }
+
+    @Override
+    public UserSession authenticateSession(SessionIdentifier publicId, String userId) {
+        // Prevención de Deadlocks distribuidos (10s lease time max)
+        try (SessionBackendSPI.DistributedLock ignored = backend.acquireLock("L:" + userId, Duration.ofSeconds(10))) {
+            
+            enforceConcurrencyPolicy(userId);
+            
+            Session rotated = rotatePublicId(publicId);
+            SessionStateDto state = backend.getState(rotated.getInternalId().getValue()).get();
+            
+            // FSM: Transición
+            state.status = fsm.fire(state.status, SessionEvent.AUTHENTICATE, new SessionContext(userId));
+            state.userId = userId;
+            
+            backend.saveState(state);
+            backend.indexUserSession(userId, state.internalId);
+            
+            return (UserSession) buildSession(state);
+        }
+    }
+
+    @Override
+    public List<UserSession> getSessionsForUser(String userId) {
+        List<SessionStateDto> states = backend.getInternalIdsForUser(userId).stream()
+            .map(backend::getState).filter(Optional::isPresent).map(Optional::get)
+            .collect(Collectors.toList());
+
+        Map<Boolean, List<SessionStateDto>> partitioned = states.stream()
+            .collect(Collectors.partitioningBy(s -> expirationManager.isExpired(s.creationTime, s.lastAccessTime)));
+
+        partitioned.get(true).forEach(s -> invalidateWithFsm(s, SessionEvent.EXPIRE));
+        
+        return partitioned.get(false).stream().map(s -> (UserSession) buildSession(s)).collect(Collectors.toList());
+    }
+
+    @Override
+    public void invalidateAllUserSessions(String userId) {
+        backend.getInternalIdsForUser(userId).stream()
+            .map(backend::getState).filter(Optional::isPresent).map(Optional::get)
+            .forEach(s -> invalidateWithFsm(s, SessionEvent.REVOKE));
+    }
+
+    @Override
+    public void touch(SessionIdentifier publicId) {
+        backend.getInternalId(publicId.getValue()).ifPresent(internalId -> {
+            backend.getState(internalId).ifPresent(state -> {
+                if(state.status == SessionStatus.INIT || state.status == SessionStatus.AUTHENTICATED) {
+                    state.lastAccessTime = Instant.now();
+                    backend.saveState(state);
+                }
+            });
+        });
+    }
+
+    @Override
+    public void invalidateSession(SessionIdentifier publicId) {
+        backend.getInternalId(publicId.getValue()).flatMap(backend::getState)
+            .ifPresent(s -> invalidateWithFsm(s, SessionEvent.REVOKE));
+    }
+
+    // --- Private ---
+
+    private void enforceConcurrencyPolicy(String userId) {
+        if (concurrencyPolicy == UserSessionConcurrencyPolicy.MULTIPLE) return;
+        List<UserSession> active = getSessionsForUser(userId);
+        if (active.isEmpty()) return;
+
+        if (concurrencyPolicy == UserSessionConcurrencyPolicy.SINGLE_REJECT) {
+            throw new ConcurrentSessionRejectedException("El usuario ya posee una sesión activa.");
+        } else if (concurrencyPolicy == UserSessionConcurrencyPolicy.SINGLE_REPLACE) {
+            invalidateAllUserSessions(userId);
+        }
+    }
+
+    private boolean checkExpirationAndClean(SessionStateDto state) {
+        if (expirationManager.isExpired(state.creationTime, state.lastAccessTime)) {
+            invalidateWithFsm(state, SessionEvent.EXPIRE);
+            return false;
+        }
+        return true;
+    }
+
+    private void invalidateWithFsm(SessionStateDto state, SessionEvent reason) {
+        try {
+            state.status = fsm.fire(state.status, reason, new SessionContext(state.userId));
+            backend.deleteState(state.internalId);
+            backend.deleteRoute(state.currentPublicId);
+            if (state.userId != null) backend.removeUserSession(state.userId, state.internalId);
+            backend.clearAllAttributes(state.internalId);
+        } catch (IllegalStateException ignored) {
+            // FSM Rechaza la transición (ej. intentando expirar una sesión ya invalidada) -> Idempotencia
+        }
+    }
+
+    private Session buildSession(SessionStateDto state) {
+        AttributeStorage storage = new GenericAttributeStorage(state.internalId, backend);
+        return state.userId != null 
+            ? new ImplUserSession(state, storage, this) 
+            : new ImplSession(state, storage, this);
+    }
+}
+
+// --- Clases Internas del Core ---
+
+class ImplSession implements Session {
+    final SessionStateDto state; final AttributeStorage storage; final GenericSessionManager manager;
+    ImplSession(SessionStateDto s, AttributeStorage st, GenericSessionManager m) { state = s; storage = st; manager = m; }
+    @Override public SessionIdentifier getPublicId() { return SessionIdentifier.of(state.currentPublicId); }
+    @Override public InternalSessionIdentifier getInternalId() { return InternalSessionIdentifier.of(state.internalId); }
+    @Override public SessionStatus getStatus() { return state.status; }
+    @Override public Instant getCreationTime() { return state.creationTime; }
+    @Override public Instant getLastAccessTime() { return state.lastAccessTime; }
+    @Override public AttributeStorage getAttributes() { return storage; }
+    @Override public void invalidate() { manager.invalidateSession(getPublicId()); }
+}
+
+class ImplUserSession extends ImplSession implements UserSession {
+    ImplUserSession(SessionStateDto s, AttributeStorage st, GenericSessionManager m) { super(s, st, m); }
+    @Override public String getUserId() { return state.userId; }
+}
+
+class GenericAttributeStorage implements AttributeStorage {
+    private final String id; private final SessionBackendSPI backend;
+    GenericAttributeStorage(String i, SessionBackendSPI b) { id = i; backend = b; }
+    @Override public <T> Optional<T> get(TypedAttributeKey<T> key) { return backend.getAttribute(id, key.getName(), key.getType()); }
+    @Override public <T> void put(TypedAttributeKey<T> key, T value) { backend.putAttribute(id, key.getName(), value); }
+    @Override public <T> void remove(TypedAttributeKey<T> key) { backend.removeAttribute(id, key.getName()); }
+    @Override public void clear() { backend.clearAllAttributes(id); }
+}
+
+// ==========================================
+// 7. INFRASTRUCTURE: Legacy Hazelcast Adapter
+// ==========================================
+
+public class LegacyHazelcastBackend implements SessionBackendSPI {
+    private final IMap<String, Object> sharedMap;
+    private final MultiMap<String, String> userSessionsIndex;
+
+    public LegacyHazelcastBackend(HazelcastInstance hz, String mapName, String multiMapName) {
+        this.sharedMap = hz.getMap(mapName);
+        this.userSessionsIndex = hz.getMultiMap(multiMapName);
+    }
+
+    @Override public Optional<String> getInternalId(String pub) { return Optional.ofNullable((String) sharedMap.get("R:" + pub)); }
+    @Override public boolean mapRouteIfAbsent(String pub, String internal) { return sharedMap.putIfAbsent("R:" + pub, internal) == null; }
+    @Override public void deleteRoute(String pub) { sharedMap.remove("R:" + pub); }
+    
+    @Override public void saveState(SessionStateDto state) { sharedMap.put("S:" + state.internalId, state); }
+    @Override public Optional<SessionStateDto> getState(String internal) { return Optional.ofNullable((SessionStateDto) sharedMap.get("S:" + internal)); }
+    @Override public void deleteState(String internal) { sharedMap.remove("S:" + internal); }
+    
+    @Override public void indexUserSession(String usr, String internal) { userSessionsIndex.put(usr, internal); }
+    @Override public void removeUserSession(String usr, String internal) { userSessionsIndex.remove(usr, internal); }
+    @Override public List<String> getInternalIdsForUser(String usr) { 
+        Collection<String> c = userSessionsIndex.get(usr); return c != null ? new ArrayList<>(c) : Collections.emptyList(); 
+    }
+    
+    @Override public DistributedLock acquireLock(String lockKey, Duration ttl) {
+        sharedMap.lock(lockKey, ttl.toMillis(), TimeUnit.MILLISECONDS);
+        return () -> { try { sharedMap.unlock(lockKey); } catch (IllegalMonitorStateException ignored) {} };
+    }
+
+    @Override public <T> Optional<T> getAttribute(String internal, String key, Class<T> type) {
+        return Optional.ofNullable(sharedMap.get("A:" + internal + ":" + key)).map(type::cast);
+    }
+    @Override public void putAttribute(String internal, String key, Object value) { sharedMap.put("A:" + internal + ":" + key, value); }
+    @Override public void removeAttribute(String internal, String key) { sharedMap.remove("A:" + internal + ":" + key); }
+    @Override public void clearAllAttributes(String internal) {
+        String pfx = "A:" + internal + ":";
+        sharedMap.keySet().stream().filter(k -> k.startsWith(pfx)).collect(Collectors.toSet()).forEach(sharedMap::remove);
+    }
+}
+
+// ==========================================
+// 8. OBSERVABILITY: OpenTelemetry Decorators
+// ==========================================
+
+public class ObservableSessionManager implements UserSessionManager {
+    private final UserSessionManager delegate;
+    private final Tracer tracer;
+    private final LongCounter authCounter;
+
+    public ObservableSessionManager(UserSessionManager delegate, OpenTelemetry otel) {
+        this.delegate = delegate;
+        this.tracer = otel.getTracer("session-manager");
+        this.authCounter = otel.getMeter("session-metrics").counterBuilder("session.authenticated").build();
+    }
+
+    @Override
+    public UserSession authenticateSession(SessionIdentifier publicId, String userId) {
+        Span span = tracer.spanBuilder("authenticateSession").setAttribute("user.id", userId).startSpan();
+        try (var scope = span.makeCurrent()) {
+            UserSession s = delegate.authenticateSession(publicId, userId);
+            authCounter.add(1);
+            return s;
+        } catch (ConcurrentSessionRejectedException e) {
+            span.addEvent("Concurrency policy rejected").setStatus(StatusCode.ERROR);
+            throw e;
+        } catch (Exception e) {
+            span.recordException(e).setStatus(StatusCode.ERROR); throw e;
+        } finally {
+            span.end();
+        }
+    }
+    
+    // Delegación llana para los demás métodos...
+    @Override public Session createSession() { return delegate.createSession(); }
+    @Override public Optional<Session> getSession(SessionIdentifier id) { return delegate.getSession(id); }
+    @Override public Session rotatePublicId(SessionIdentifier id) { return delegate.rotatePublicId(id); }
+    @Override public List<UserSession> getSessionsForUser(String u) { return delegate.getSessionsForUser(u); }
+    @Override public void invalidateAllUserSessions(String u) { delegate.invalidateAllUserSessions(u); }
+    @Override public void touch(SessionIdentifier id) { delegate.touch(id); }
+    @Override public void invalidateSession(SessionIdentifier id) { delegate.invalidateSession(id); }
+}
+
+public class ObservableSessionBackendSPI implements SessionBackendSPI {
+    private final SessionBackendSPI delegate;
+    private final Tracer tracer;
+    private final DoubleHistogram latency;
+
+    public ObservableSessionBackendSPI(SessionBackendSPI delegate, OpenTelemetry otel) {
+        this.delegate = delegate;
+        this.tracer = otel.getTracer("session-backend-spi");
+        this.latency = otel.getMeter("session-metrics").histogramBuilder("backend.io.duration").setUnit("ms").build();
+    }
+
+    @Override
+    public DistributedLock acquireLock(String lockKey, Duration maxLeaseTime) {
+        Span span = tracer.spanBuilder("backend.acquireLock").setAttribute("lock.key", lockKey).startSpan();
+        long startNs = System.nanoTime();
+        try (var scope = span.makeCurrent()) {
+            DistributedLock realLock = delegate.acquireLock(lockKey, maxLeaseTime);
+            return () -> {
+                Span unlockSpan = tracer.spanBuilder("backend.releaseLock").startSpan();
+                try { realLock.close(); } finally { unlockSpan.end(); }
+            };
+        } finally {
+            span.end();
+            latency.record((System.nanoTime() - startNs) / 1_000_000.0, Attributes.of(io.opentelemetry.api.common.AttributeKey.stringKey("op"), "acquireLock"));
+        }
+    }
+
+    // Delegación llana de los demás métodos... (Omitidos los wrappers de telemetría repetitivos por brevedad del snippet)
+    @Override public Optional<String> getInternalId(String pub) { return delegate.getInternalId(pub); }
+    @Override public boolean mapRouteIfAbsent(String pub, String internal) { return delegate.mapRouteIfAbsent(pub, internal); }
+    @Override public void deleteRoute(String pub) { delegate.deleteRoute(pub); }
+    @Override public void saveState(SessionStateDto state) { delegate.saveState(state); }
+    @Override public Optional<SessionStateDto> getState(String internal) { return delegate.getState(internal); }
+    @Override public void deleteState(String internal) { delegate.deleteState(internal); }
+    @Override public void indexUserSession(String usr, String internal) { delegate.indexUserSession(usr, internal); }
+    @Override public void removeUserSession(String usr, String internal) { delegate.removeUserSession(usr, internal); }
+    @Override public List<String> getInternalIdsForUser(String usr) { return delegate.getInternalIdsForUser(usr); }
+    @Override public <T> Optional<T> getAttribute(String intId, String key, Class<T> t) { return delegate.getAttribute(intId, key, t); }
+    @Override public void putAttribute(String intId, String k, Object v) { delegate.putAttribute(intId, k, v); }
+    @Override public void removeAttribute(String intId, String k) { delegate.removeAttribute(intId, k); }
+    @Override public void clearAllAttributes(String intId) { delegate.clearAllAttributes(intId); }
+}
