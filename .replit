@@ -1,0 +1,2 @@
+run = "mvn -q compile exec:java"
+modules = ["java-graalvm22.3"]
