@@ -1,0 +1,1 @@
+- [Hazelcast test execution](hazelcast-test-execution.md) — Run Hazelcast-backed Maven tests as background tasks; direct shell output may stop during cluster startup.
